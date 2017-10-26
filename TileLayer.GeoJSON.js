@@ -1,260 +1,541 @@
-// Load data tiles from an AJAX data source
-L.TileLayer.Ajax = L.TileLayer.extend({
-    _requests: [],
-    _addTile: function (tilePoint) {
-        var tile = { datum: null, processed: false };
-        this._tiles[tilePoint.x + ':' + tilePoint.y] = tile;
-        this._loadTile(tile, tilePoint);
+/*
+    GeoJSON layer with mouse hover events to properties for each feature
+    Requires JQuery to handle the AJAX requests
+    Currently only supports FeatureCollections
+    Features must have ID's, so they can be deduplicated across tiles (not rendered twice).
+*/
+
+/*
+Control that shows HTML content for a point on hover
+*/
+L.Control.Hover = L.Control.extend({
+    options: {
+        position: "hover",
+        offset: new L.Point(30,-16)
     },
-    // XMLHttpRequest handler; closure over the XHR object, the layer, and the tile
-    _xhrHandler: function (req, layer, tile, tilePoint) {
-        return function () {
-            if (req.readyState !== 4) {
-                return;
-            }
-            var s = req.status;
-            if ((s >= 200 && s < 300 && s != 204) || s === 304) {
-                tile.datum = JSON.parse(req.responseText);
-                layer._tileLoaded(tile, tilePoint);
-            } else {
-                layer._tileLoaded(tile, tilePoint);
-            }
-        };
+    
+    initialize: function(point, content, options) {
+        this._point = point;
+        this._content = content;
+                
+        L.Util.setOptions(this, options);
     },
-    // Load the requested tile via AJAX
-    _loadTile: function (tile, tilePoint) {
-        this._adjustTilePoint(tilePoint);
-        var layer = this;
-        var req = new XMLHttpRequest();
-        this._requests.push(req);
-        req.onreadystatechange = this._xhrHandler(req, layer, tile, tilePoint);
-        req.open('GET', this.getTileUrl(tilePoint), true);
-        req.send();
-    },
-    _reset: function () {
-        L.TileLayer.prototype._reset.apply(this, arguments);
-        for (var i = 0; i < this._requests.length; i++) {
-            this._requests[i].abort();
+    
+    onAdd: function (map) {
+        if (!map._controlCorners.hasOwnProperty("hover")) {
+            map._controlCorners["hover"] = L.DomUtil.create("div", "custom-hover", map._controlContainer);
         }
-        this._requests = [];
+        this._container = L.DomUtil.create('div', 'custom-control-hover-label');
+        this._container.innerHTML = this._content;
+        
+        if (this.options.position == "hover" && this._point !== null) {
+            this.setHoverPosition(this._point);
+        }
+        
+        return this._container;
     },
-    _update: function () {
-        if (this._map && this._map._panTransition && this._map._panTransition._inProgress) { return; }
-        if (this._tilesToLoad < 0) { this._tilesToLoad = 0; }
-        L.TileLayer.prototype._update.apply(this, arguments);
+
+    setHoverPosition: function (point) {
+        this._container.style.top = point.y + this.options.offset.y + "px";
+        this._container.style.left = point.x + this.options.offset.x + "px";
     }
 });
 
+/*
+Layer of GeoJSON features in a tile area
+Shows feature properties on hover
+*/
+L.GeoJSONTile = L.GeoJSON.extend({
 
-L.TileLayer.GeoJSON = L.TileLayer.Ajax.extend({
-    // Store each GeometryCollection's layer by key, if options.unique function is present
-    _keyLayers: {},
+    addLayer: function (layer) {
+        L.GeoJSON.prototype.addLayer.call(this, layer);
 
-    // Used to calculate svg path string for clip path elements
-    _clipPathRectangles: {},
+        layer._parent = this;
+        layer._featureDialogContent = this._getFeatureDialogContent(layer.feature);
 
-    initialize: function (url, options, geojsonOptions) {
-        L.TileLayer.Ajax.prototype.initialize.call(this, url, options);
-        this.geojsonLayer = new L.GeoJSON(null, geojsonOptions);
-    },
-    onAdd: function (map) {
-        this._map = map;
-        L.TileLayer.Ajax.prototype.onAdd.call(this, map);
-        map.addLayer(this.geojsonLayer);
-    },
-    onRemove: function (map) {
-        map.removeLayer(this.geojsonLayer);
-        L.TileLayer.Ajax.prototype.onRemove.call(this, map);
-    },
-    _reset: function () {
-        this.geojsonLayer.clearLayers();
-        this._keyLayers = {};
-        this._removeOldClipPaths();
-        L.TileLayer.Ajax.prototype._reset.apply(this, arguments);
-    },
+        layer.on('mouseover', this._featureMouseOver);
+        layer.on('mousemove', this._featureMouseMove);
+        layer.on('mouseout', this._featureMouseOut);
 
-    _getUniqueId: function() {
-        return String(this._leaflet_id || ''); // jshint ignore:line
-    },
-
-    // Remove clip path elements from other earlier zoom levels
-    _removeOldClipPaths: function  () {
-        for (var clipPathId in this._clipPathRectangles) {
-            var prefix = clipPathId.split('tileClipPath')[0];
-            if (this._getUniqueId() === prefix) {
-                var clipPathZXY = clipPathId.split('_').slice(1);
-                var zoom = parseInt(clipPathZXY[0], 10);
-                if (zoom !== this._map.getZoom()) {
-                    var rectangle = this._clipPathRectangles[clipPathId];
-                    this._map.removeLayer(rectangle);
-                    var clipPath = document.getElementById(clipPathId);
-                    if (clipPath !== null) {
-                        clipPath.parentNode.removeChild(clipPath);
-                    }
-                    delete this._clipPathRectangles[clipPathId];
-                }
-            }
-        }
-    },
-
-    // Recurse LayerGroups and call func() on L.Path layer instances
-    _recurseLayerUntilPath: function (func, layer) {
-        if (layer instanceof L.Path) {
-            func(layer);
-        }
-        else if (layer instanceof L.LayerGroup) {
-            // Recurse each child layer
-            layer.getLayers().forEach(this._recurseLayerUntilPath.bind(this, func), this);
-        }
-    },
-
-    _clipLayerToTileBoundary: function (layer, tilePoint) {
-        // Only perform SVG clipping if the browser is using SVG
-        if (!L.Path.SVG) { return; }
-        if (!this._map) { return; }
-
-        if (!this._map._pathRoot) {
-            this._map._pathRoot = L.Path.prototype._createElement('svg');
-            this._map._panes.overlayPane.appendChild(this._map._pathRoot);
-        }
-        var svg = this._map._pathRoot;
-
-        // create the defs container if it doesn't exist
-        var defs = null;
-        if (svg.getElementsByTagName('defs').length === 0) {
-            defs = document.createElementNS(L.Path.SVG_NS, 'defs');
-            svg.insertBefore(defs, svg.firstChild);
-        }
-        else {
-            defs = svg.getElementsByTagName('defs')[0];
-        }
-
-        // Create the clipPath for the tile if it doesn't exist
-        var clipPathId = this._getUniqueId() + 'tileClipPath_' + tilePoint.z + '_' + tilePoint.x + '_' + tilePoint.y;
-        var clipPath = document.getElementById(clipPathId);
-        if (clipPath === null) {
-            clipPath = document.createElementNS(L.Path.SVG_NS, 'clipPath');
-            clipPath.id = clipPathId;
-
-            // Create a hidden L.Rectangle to represent the tile's area
-            var tileSize = this.options.tileSize,
-            nwPoint = tilePoint.multiplyBy(tileSize),
-            sePoint = nwPoint.add([tileSize, tileSize]),
-            nw = this._map.unproject(nwPoint),
-            se = this._map.unproject(sePoint);
-            this._clipPathRectangles[clipPathId] = new L.Rectangle(new L.LatLngBounds([nw, se]), {
-                opacity: 0,
-                fillOpacity: 0,
-                clickable: false,
-                noClip: true
-            });
-            this._map.addLayer(this._clipPathRectangles[clipPathId]);
-
-            // Add a clip path element to the SVG defs element
-            // With a path element that has the hidden rectangle's SVG path string  
-            var path = document.createElementNS(L.Path.SVG_NS, 'path');
-            var pathString = this._clipPathRectangles[clipPathId].getPathString();
-            path.setAttribute('d', pathString);
-            clipPath.appendChild(path);
-            defs.appendChild(clipPath);
-        }
-
-        // Add the clip-path attribute to reference the id of the tile clipPath
-        this._recurseLayerUntilPath(function (pathLayer) {
-            pathLayer._container.setAttribute('clip-path', 'url(' + window.location.href + '#' + clipPathId + ')');          
-        }, layer);
-    },
-
-    // Add a geojson object from a tile to the GeoJSON layer
-    // * If the options.unique function is specified, merge geometries into GeometryCollections
-    // grouped by the key returned by options.unique(feature) for each GeoJSON feature
-    // * If options.clipTiles is set, and the browser is using SVG, perform SVG clipping on each
-    // tile's GeometryCollection 
-    addTileData: function (geojson, tilePoint) {
-        var features = L.Util.isArray(geojson) ? geojson : geojson.features,
-            i, len, feature;
-
-        if (features) {
-            for (i = 0, len = features.length; i < len; i++) {
-                // Only add this if geometry or geometries are set and not null
-                feature = features[i];
-                if (feature.geometries || feature.geometry || feature.features || feature.coordinates) {
-                    this.addTileData(features[i], tilePoint);
-                }
-            }
-            return this;
-        }
-
-        var options = this.geojsonLayer.options;
-
-        if (options.filter && !options.filter(geojson)) { return; }
-
-        var parentLayer = this.geojsonLayer;
-        var incomingLayer = null;
-        if (this.options.unique && typeof(this.options.unique) === 'function') {
-            var key = this.options.unique(geojson);
-
-            // When creating the layer for a unique key,
-            // Force the geojson to be a geometry collection
-            if (!(key in this._keyLayers && geojson.geometry.type !== 'GeometryCollection')) {
-                geojson.geometry = {
-                    type: 'GeometryCollection',
-                    geometries: [geojson.geometry]
-                };
-            }
-
-            // Transform the geojson into a new Layer
-            try {
-                incomingLayer = L.GeoJSON.geometryToLayer(geojson, options.pointToLayer, options.coordsToLatLng);
-            }
-            // Ignore GeoJSON objects that could not be parsed
-            catch (e) {
-                return this;
-            }
-
-            incomingLayer.feature = L.GeoJSON.asFeature(geojson);
-            // Add the incoming Layer to existing key's GeometryCollection
-            if (key in this._keyLayers) {
-                parentLayer = this._keyLayers[key];
-                parentLayer.feature.geometry.geometries.push(geojson.geometry);
-            }
-            // Convert the incoming GeoJSON feature into a new GeometryCollection layer
-            else {
-                this._keyLayers[key] = incomingLayer;
-            }
-        }
-        // Add the incoming geojson feature to the L.GeoJSON Layer
-        else {
-            // Transform the geojson into a new layer
-            try {
-                incomingLayer = L.GeoJSON.geometryToLayer(geojson, options.pointToLayer, options.coordsToLatLng);
-            }
-            // Ignore GeoJSON objects that could not be parsed
-            catch (e) {
-                return this;
-            }
-            incomingLayer.feature = L.GeoJSON.asFeature(geojson);
-        }
-        incomingLayer.defaultOptions = incomingLayer.options;
-
-        this.geojsonLayer.resetStyle(incomingLayer);
-
-        if (options.onEachFeature) {
-            options.onEachFeature(geojson, incomingLayer);
-        }
-        parentLayer.addLayer(incomingLayer);
-
-        // If options.clipTiles is set and the browser is using SVG
-        // then clip the layer using SVG clipping
-        if (this.options.clipTiles) {
-            this._clipLayerToTileBoundary(incomingLayer, tilePoint);
-        }
         return this;
     },
 
-    _tileLoaded: function (tile, tilePoint) {
-        L.TileLayer.Ajax.prototype._tileLoaded.apply(this, arguments);
-        if (tile.datum === null) { return null; }
-        this.addTileData(tile.datum, tilePoint);
+    removeLayer: function (layer) {
+        L.GeoJSON.prototype.removeLayer.call(this, layer);
+
+        if (layer._featureDialogControl) {
+            layer._parent._map.removeControl(layer._featureDialogControl);
+        }
+        layer._parent = null;
+
+        layer.off('mouseover', this._featureMouseOver);
+        layer.off('mousemove', this._featureMouseMove);
+        layer.off('mouseout', this._featureMouseOut);
+        
+        return this;
+    },
+    
+    onRemove: function (map) {
+        this.eachLayer(this.removeLayer, this);
+    },
+
+    _createFeatureDialogControl: function(hoverPoint, dialogContent) {
+        return new L.Control.Hover(hoverPoint, dialogContent, {
+            'offset': this.options.hoverOffset
+        });
+    },
+
+    _featureMouseOver: function (evt) {
+        var tile = this._parent;
+        var hoverPoint = tile._map.mouseEventToContainerPoint(evt.originalEvent);
+
+        if (!this._featureDialogControl) {
+            this._featureDialogControl = tile._createFeatureDialogControl(hoverPoint, this._featureDialogContent);
+            tile._map.addControl(this._featureDialogControl);
+        }
+        
+        if (this.setStyle !== undefined) {
+            // Set layer to hover style so we can see the hovered feature
+            this.setStyle(tile.options.hoverStyle);
+        }
+    },
+
+    _featureMouseMove: function (evt) {
+        var tile = this._parent;
+        // Move current hover control to mouse pointer
+        var hoverPoint = tile._map.mouseEventToContainerPoint(evt.originalEvent);
+        this._featureDialogControl.setHoverPosition(hoverPoint);
+    },
+
+    _featureMouseOut: function (evt) {
+        var tile = this._parent;
+        if (this._featureDialogControl) {
+            tile._map.removeControl(this._featureDialogControl);
+            this._featureDialogControl = null;
+        }
+
+        if (this.setStyle !== undefined) {
+            // Revert to original style
+            this.setStyle(tile.options.style);
+        }
+    },
+
+    _getFeatureDialogContent: function (feature) {
+        var hoverContent = '<div class="geojson-dialog-hover">';
+        
+        // heading
+        if (this.options.hoverHeadingProperty && this.options.hoverHeadingProperty in feature.properties) {
+            var heading = feature.properties[this.options.hoverHeadingProperty];
+            hoverContent += '<p class="geojson-feature-heading">'+heading+'</p>';
+        } 
+       
+        for(var key in feature.properties) {
+            if (key === this.options.hoverHeadingProperty) {
+                continue;
+            }
+            var value = feature.properties[key];
+            hoverContent += '<p class="geojson-feature-property">';
+            hoverContent += '<span class="geojson-feature-property-name">' + key + '</span>';
+            hoverContent += '<span class="geojson-feature-property-value">' + value + '</span>';
+            hoverContent += '</p>';
+        }
+        hoverContent += '</div>';
+        return hoverContent;
     }
+
+});
+
+
+/*
+    TileLayer that retrieves and shows GeoJSON tiles, with an {Z}/{X}/{Y} style URL.
+    Each tile is a GeoJSONHover layer (set of feature layers)
+    Features are deduplicated across tiles by their id.
+    Currently assumes a FeatureCollection
+*/
+L.TileLayer.GeoJSON = L.TileLayer.extend({
+    includes: L.Mixin.Events,
+
+    options: {
+        minZoom: 0,
+        maxZoom: 18,
+        tileSize: 256,
+        subdomains: 'abc',
+        errorTileUrl: '',
+        attribution: '',
+        zoomOffset: 0,
+        opacity: 1,
+
+        zIndex: null,
+        tms: false,
+        continuousWorld: false,
+        noWrap: false,
+        zoomReverse: false,
+        detectRetina: false,
+        
+        updateWhenIdle: L.Browser.mobile
+    },
+
+    geoJSONOptions: {
+        /* style of GeoJSON feature */
+        style: {
+            "color": "#00D",
+            "fillColor": "#00D",
+            "weight": 1.0,
+            "opacity": 0.5,
+            "fillOpacity": 0.1
+        },
+        /* style of GeoJSON feature when hovered */
+        hoverStyle: {
+            "opacity": 0.5,
+            "fillOpacity": 0.3
+        },
+        hoverOffset: new L.Point(15,-15),
+        hoverHeadingProperty: 'name'
+    },
+
+    initialize: function (url, options) {
+        L.Util.setOptions(this, options);
+
+        // detecting retina displays, adjusting tileSize and zoom levels
+        if (this.options.detectRetina && L.Browser.retina && this.options.maxZoom > 0) {
+
+            this.options.tileSize = Math.floor(this.options.tileSize / 2);
+            this.options.zoomOffset++;
+
+            if (this.options.minZoom > 0) {
+                this.options.minZoom--;
+            }
+            this.options.maxZoom--;
+        }
+
+        this._url = url;
+
+        var subdomains = this.options.subdomains;
+
+        if (typeof subdomains === 'string') {
+            this.options.subdomains = subdomains.split('');
+        }
+    },
+
+    onAdd: function (map) {
+        this._map = map;
+
+        // set up events
+        map.on({
+            'viewreset': this._resetCallback,
+            'moveend': this._update
+        }, this);
+
+        if (!this.options.updateWhenIdle) {
+            this._limitedUpdate = L.Util.limitExecByInterval(this._update, 150, this);
+            map.on('move', this._limitedUpdate, this);
+        }
+
+        this._reset();
+        this._update();
+    },
+
+    addTo: function (map) {
+        map.addLayer(this);
+        return this;
+    },
+
+    onRemove: function (map) {
+        map.off({
+            'viewreset': this._resetCallback,
+            'moveend': this._update
+        }, this);
+
+        if (!this.options.updateWhenIdle) {
+            map.off('move', this._limitedUpdate, this);
+        }
+        this._reset();
+        this._map = null;
+    },
+
+    setGeoJSONOptions: function(options) {
+        this.geoJSONOptions = L.Util.extend({}, this.geoJSONOptions, options);
+    },
+
+    _resetCallback: function (e) {
+        this._reset(e.hard);
+    },
+
+    // viewreset event triggered (e.g. zoom changed)
+    // remove all tiles from previous zoom level
+    _reset: function (clearOldContainer) {
+        var key,
+            tiles = this._tiles;
+
+        for (key in tiles) {
+            if (tiles.hasOwnProperty(key)) {
+                this.fire('tileunload', {tile: tiles[key]});
+                this._removeTile(key);
+            }
+        }
+
+        this._tiles = {};
+        this._tilesToLoad = 0;
+
+        // geojson features by id
+        // used to deduplicate features across adjacent tiles
+        this._geoJSONFeatures = {};
+
+    },
+
+    // moveend event triggered (e.g. map panned)
+    // add any new tiles required
+    _update: function (e) {
+        if (this._map._panTransition && this._map._panTransition._inProgress) { return; }
+
+        var bounds   = this._map.getPixelBounds(),
+            zoom     = this._map.getZoom(),
+            tileSize = this.options.tileSize;
+
+        if (zoom > this.options.maxZoom || zoom < this.options.minZoom) {
+            return;
+        }
+
+        var nwTilePoint = new L.Point(
+                Math.floor(bounds.min.x / tileSize),
+                Math.floor(bounds.min.y / tileSize)),
+            seTilePoint = new L.Point(
+                Math.floor(bounds.max.x / tileSize),
+                Math.floor(bounds.max.y / tileSize)),
+            tileBounds = new L.Bounds(nwTilePoint, seTilePoint);
+
+        this._addTilesFromCenterOut(tileBounds);
+    },
+
+    _addTilesFromCenterOut: function (bounds) {
+        var queue = [],
+            center = bounds.getCenter();
+
+        var j, i, point;
+
+        for (j = bounds.min.y; j <= bounds.max.y; j++) {
+            for (i = bounds.min.x; i <= bounds.max.x; i++) {
+                point = new L.Point(i, j);
+
+                if (this._tileShouldBeLoaded(point)) {
+                    queue.push(point);
+                }
+            }
+        }
+
+        var tilesToLoad = queue.length;
+
+        if (tilesToLoad === 0) { return; }
+
+        // load tiles in order of their distance to center
+        queue.sort(function (a, b) {
+            return a.distanceTo(center) - b.distanceTo(center);
+        });
+
+        // if its the first batch of tiles to load
+        if (!this._tilesToLoad) {
+            this.fire('loading');
+        }
+
+        this._tilesToLoad += tilesToLoad;
+
+        for (i = 0; i < tilesToLoad; i++) {
+            this._addTile(queue[i]);
+        }
+
+    },
+
+    _tileShouldBeLoaded: function (tilePoint) {
+        if ((tilePoint.x + ':' + tilePoint.y) in this._tiles) {
+            return false; // already loaded
+        }
+
+        if (!this.options.continuousWorld) {
+            var limit = this._getWrapTileNum();
+
+            if (this.options.noWrap && (tilePoint.x < 0 || tilePoint.x >= limit) ||
+                                        tilePoint.y < 0 || tilePoint.y >= limit) {
+                return false; // exceeds world bounds
+            }
+        }
+        return true;
+    },
+
+    _removeOtherTiles: function (bounds) {
+        var kArr, x, y, key;
+
+        for (key in this._tiles) {
+            if (this._tiles.hasOwnProperty(key)) {
+                kArr = key.split(':');
+                x = parseInt(kArr[0], 10);
+                y = parseInt(kArr[1], 10);
+
+                // remove tile if it's out of bounds
+                if (x < bounds.min.x || x > bounds.max.x || y < bounds.min.y || y > bounds.max.y) {
+                    this._removeTile(key);
+                }
+            }
+        }
+    },
+
+    _removeTile: function (key) {
+        var tile = this._tiles[key];
+
+        this.fire("tileunload", {tile: tile, url: tile._url});
+
+        if (!L.Browser.android) { //For https://github.com/CloudMade/Leaflet/issues/137
+            tile._url = L.Util.emptyImageUrl;
+        }
+
+        delete this._tiles[key];
+        this._map.removeLayer(tile);
+    },
+
+    _addTile: function (tilePoint) {
+        var tilePos = this._getTilePos(tilePoint);
+
+        // get unused tile - or create a new tile
+        var tile = this._getTile();
+        tile._url = this.getTileUrl(tilePoint);
+
+        this._tiles[tilePoint.x + ':' + tilePoint.y] = tile;
+
+        this._loadTile(tile, tilePoint);
+
+        this._map.addLayer(tile);
+    },
+
+    _getZoomForUrl: function () {
+        var options = this.options,
+            zoom = this._map.getZoom();
+
+        if (options.zoomReverse) {
+            zoom = options.maxZoom - zoom;
+        }
+
+        return zoom + options.zoomOffset;
+    },
+
+    _getTilePos: function (tilePoint) {
+        var origin = this._map.getPixelOrigin(),
+            tileSize = this.options.tileSize;
+
+        return tilePoint.multiplyBy(tileSize).subtract(origin);
+    },
+
+    getTileUrl: function (tilePoint) {
+        this._adjustTilePoint(tilePoint);
+
+        return L.Util.template(this._url, L.Util.extend({
+            s: this._getSubdomain(tilePoint),
+            z: this._getZoomForUrl(),
+            x: tilePoint.x,
+            y: tilePoint.y
+        }, this.options));
+    },
+
+    _getWrapTileNum: function () {
+        // TODO refactor, limit is not valid for non-standard projections
+        return Math.pow(2, this._getZoomForUrl());
+    },
+
+    _adjustTilePoint: function (tilePoint) {
+
+        var limit = this._getWrapTileNum();
+
+        // wrap tile coordinates
+        if (!this.options.continuousWorld && !this.options.noWrap) {
+            tilePoint.x = ((tilePoint.x % limit) + limit) % limit;
+        }
+
+        if (this.options.tms) {
+            tilePoint.y = limit - tilePoint.y - 1;
+        }
+    },
+
+    _getSubdomain: function (tilePoint) {
+        var index = (tilePoint.x + tilePoint.y) % this.options.subdomains.length;
+        return this.options.subdomains[index];
+    },
+
+    _createTile: function() {
+        return new L.GeoJSONTile(null, this.geoJSONOptions);
+    },
+
+    _getTile: function () {
+        return this._createTile();
+    },
+
+    _resetTile: function (tile) {
+        // Override if data stored on a tile needs to be cleaned up before reuse
+    },
+
+    /* 
+    Get the tile URL and load it's GeoJSON
+    The GeoJSON is loaded using JQuery, 
+    and the response is assumed to be a FeatureCollection
+    Dedupe any features that have been loaded from other adjacent tiles
+    */
+    _loadTile: function (tile, tilePoint) {
+        tile._layer = this;
+
+        var url = tile._url;
+
+        $.ajax({
+            url: url, 
+            dataType: 'json',
+
+            success: function(data) {
+                // convert each feature of the geojson object to a layer
+                // put the layer in the internal feature group
+
+                for(var f in data.features) {
+
+                    var feature = data.features[f];
+                    // dedupe features that are already in the layer 
+                    // from already loaded adjacent tiles
+                    if(feature.id in tile._layer._geoJSONFeatures) {
+                        continue;
+                    }
+                    tile.addData(feature);
+                    tile._layer._geoJSONFeatures[feature.id] = feature;
+                }
+
+                tile._layer._tileOnLoad.call(tile);
+            },
+            error: function() {
+                tile._layer._tileOnError.call(tile);
+            }
+        });
+    },
+
+    _tileLoaded: function () {
+        this._tilesToLoad--;
+        if (!this._tilesToLoad) {
+            this.fire('load');
+        }
+    },
+
+    _tileOnLoad: function () {
+        var layer = this._layer;
+        layer._tileLoaded();
+    },
+
+    _tileOnError: function () {
+        var tile = this;
+        var layer = tile._layer;
+
+        layer.fire('tileerror', {
+            tile: this,
+            url: this._url
+        });
+
+        var newUrl = layer.options.errorTileUrl;
+        if (newUrl) {
+            this._url = newUrl;
+        }
+
+        layer._tileLoaded();
+    }
+
 });
