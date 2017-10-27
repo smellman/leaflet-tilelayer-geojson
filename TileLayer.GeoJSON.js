@@ -13,25 +13,25 @@ L.Control.Hover = L.Control.extend({
         position: "hover",
         offset: new L.Point(30,-16)
     },
-    
+
     initialize: function(point, content, options) {
         this._point = point;
         this._content = content;
-                
+
         L.Util.setOptions(this, options);
     },
-    
+
     onAdd: function (map) {
         if (!map._controlCorners.hasOwnProperty("hover")) {
             map._controlCorners["hover"] = L.DomUtil.create("div", "custom-hover", map._controlContainer);
         }
         this._container = L.DomUtil.create('div', 'custom-control-hover-label');
         this._container.innerHTML = this._content;
-        
+
         if (this.options.position == "hover" && this._point !== null) {
             this.setHoverPosition(this._point);
         }
-        
+
         return this._container;
     },
 
@@ -71,10 +71,10 @@ L.GeoJSONTile = L.GeoJSON.extend({
         layer.off('mouseover', this._featureMouseOver);
         layer.off('mousemove', this._featureMouseMove);
         layer.off('mouseout', this._featureMouseOut);
-        
+
         return this;
     },
-    
+
     onRemove: function (map) {
         this.eachLayer(this.removeLayer, this);
     },
@@ -93,7 +93,7 @@ L.GeoJSONTile = L.GeoJSON.extend({
             this._featureDialogControl = tile._createFeatureDialogControl(hoverPoint, this._featureDialogContent);
             tile._map.addControl(this._featureDialogControl);
         }
-        
+
         if (this.setStyle !== undefined) {
             // Set layer to hover style so we can see the hovered feature
             this.setStyle(tile.options.hoverStyle);
@@ -122,13 +122,13 @@ L.GeoJSONTile = L.GeoJSON.extend({
 
     _getFeatureDialogContent: function (feature) {
         var hoverContent = '<div class="geojson-dialog-hover">';
-        
+
         // heading
         if (this.options.hoverHeadingProperty && this.options.hoverHeadingProperty in feature.properties) {
             var heading = feature.properties[this.options.hoverHeadingProperty];
             hoverContent += '<p class="geojson-feature-heading">'+heading+'</p>';
-        } 
-       
+        }
+
         for(var key in feature.properties) {
             if (key === this.options.hoverHeadingProperty) {
                 continue;
@@ -153,7 +153,7 @@ L.GeoJSONTile = L.GeoJSON.extend({
     Currently assumes a FeatureCollection
 */
 L.TileLayer.GeoJSON = L.TileLayer.extend({
-    includes: L.Mixin.Events,
+    includes: L.Evented,
 
     options: {
         minZoom: 0,
@@ -171,7 +171,7 @@ L.TileLayer.GeoJSON = L.TileLayer.extend({
         noWrap: false,
         zoomReverse: false,
         detectRetina: false,
-        
+
         updateWhenIdle: L.Browser.mobile
     },
 
@@ -192,6 +192,7 @@ L.TileLayer.GeoJSON = L.TileLayer.extend({
         hoverOffset: new L.Point(15,-15),
         hoverHeadingProperty: 'name'
     },
+
 
     initialize: function (url, options) {
         L.Util.setOptions(this, options);
@@ -227,7 +228,7 @@ L.TileLayer.GeoJSON = L.TileLayer.extend({
         }, this);
 
         if (!this.options.updateWhenIdle) {
-            this._limitedUpdate = L.Util.limitExecByInterval(this._update, 150, this);
+            this._limitedUpdate = L.Util.throttle(this._update, 150, this);
             map.on('move', this._limitedUpdate, this);
         }
 
@@ -470,10 +471,9 @@ L.TileLayer.GeoJSON = L.TileLayer.extend({
         // Override if data stored on a tile needs to be cleaned up before reuse
     },
 
-    /* 
+    /*
     Get the tile URL and load it's GeoJSON
-    The GeoJSON is loaded using JQuery, 
-    and the response is assumed to be a FeatureCollection
+    The response is assumed to be a FeatureCollection
     Dedupe any features that have been loaded from other adjacent tiles
     */
     _loadTile: function (tile, tilePoint) {
@@ -481,32 +481,34 @@ L.TileLayer.GeoJSON = L.TileLayer.extend({
 
         var url = tile._url;
 
-        $.ajax({
-            url: url, 
-            dataType: 'json',
+        var success = function() {
+          var data = JSON.parse(this.responseText);
+          for(var f in data.features) {
+              var feature = data.features[f];
+              // dedupe features that are already in the layer
+              // from already loaded adjacent tiles
+              if(feature.id && feature.id in tile._layer._geoJSONFeatures) {
+                  continue;
+              }
+              tile.addData(feature);
+              if (feature.id) {
+                tile._layer._geoJSONFeatures[feature.id] = feature;
+              }
+          }
 
-            success: function(data) {
-                // convert each feature of the geojson object to a layer
-                // put the layer in the internal feature group
+          tile._layer._tileOnLoad.call(tile);
 
-                for(var f in data.features) {
+        }
 
-                    var feature = data.features[f];
-                    // dedupe features that are already in the layer 
-                    // from already loaded adjacent tiles
-                    if(feature.id in tile._layer._geoJSONFeatures) {
-                        continue;
-                    }
-                    tile.addData(feature);
-                    tile._layer._geoJSONFeatures[feature.id] = feature;
-                }
+        var error = function() {
+          tile._layer._tileOnError.call(tile);
+        }
 
-                tile._layer._tileOnLoad.call(tile);
-            },
-            error: function() {
-                tile._layer._tileOnError.call(tile);
-            }
-        });
+        var req = new XMLHttpRequest();
+        req.addEventListener('load', success);
+        req.addEventListener('error', error);
+        req.open("GET", url);
+        req.send();
     },
 
     _tileLoaded: function () {
@@ -536,6 +538,11 @@ L.TileLayer.GeoJSON = L.TileLayer.extend({
         }
 
         layer._tileLoaded();
+    },
+
+    _abortLoading: function() {
+      // do nothing
+      L.TileLayer.prototype._abortLoading.call(this);
     }
 
 });
