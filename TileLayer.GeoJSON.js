@@ -156,22 +156,6 @@ L.TileLayer.GeoJSON = L.TileLayer.extend({
     includes: L.Evented,
 
     options: {
-        minZoom: 0,
-        maxZoom: 18,
-        tileSize: 256,
-        subdomains: 'abc',
-        errorTileUrl: '',
-        attribution: '',
-        zoomOffset: 0,
-        opacity: 1,
-
-        zIndex: null,
-        tms: false,
-        continuousWorld: false,
-        noWrap: false,
-        zoomReverse: false,
-        detectRetina: false,
-
         updateWhenIdle: L.Browser.mobile
     },
 
@@ -195,27 +179,7 @@ L.TileLayer.GeoJSON = L.TileLayer.extend({
 
 
     initialize: function (url, options) {
-        L.Util.setOptions(this, options);
-
-        // detecting retina displays, adjusting tileSize and zoom levels
-        if (this.options.detectRetina && L.Browser.retina && this.options.maxZoom > 0) {
-
-            this.options.tileSize = Math.floor(this.options.tileSize / 2);
-            this.options.zoomOffset++;
-
-            if (this.options.minZoom > 0) {
-                this.options.minZoom--;
-            }
-            this.options.maxZoom--;
-        }
-
-        this._url = url;
-
-        var subdomains = this.options.subdomains;
-
-        if (typeof subdomains === 'string') {
-            this.options.subdomains = subdomains.split('');
-        }
+        L.TileLayer.prototype.initialize.call(this, url, options);
     },
 
     onAdd: function (map) {
