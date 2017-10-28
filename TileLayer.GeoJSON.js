@@ -455,6 +455,10 @@ L.TileLayer.GeoJSON = L.TileLayer.extend({
         var url = tile._url;
 
         var success = function() {
+          status = parseInt(this.status);
+          if (status >= 400) {
+            return;
+          }
           var data = JSON.parse(this.responseText);
           for(var f in data.features) {
               var feature = data.features[f];
